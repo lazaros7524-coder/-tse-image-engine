@@ -5,9 +5,17 @@ import os
 import cv2
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 
 app = FastAPI(title="TSE Image Engine")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
