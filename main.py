@@ -110,12 +110,14 @@ def health():
 @app.post("/vectorize")
 async def vectorize(
     file: UploadFile = File(...),
-    low_threshold: int = Query(60, description="آستانه‌ی پایین Canny"),
-    high_threshold: int = Query(160, description="آستانه‌ی بالای Canny"),
-    smoothing: int = Query(3, description="تعداد دفعات اجرای فیلتر هموارساز (حذف بافت ریز مثل ریش/مو)"),
+    low_threshold: int = Query(35, description="آستانه‌ی پایین Canny"),
+    high_threshold: int = Query(110, description="آستانه‌ی بالای Canny"),
+    smoothing: int = Query(5, description="تعداد دفعات اجرای فیلتر هموارساز (حذف بافت ریز مثل ریش/مو)"),
+    sigma_color: int = Query(80, description="قدرت فیلتر هموارساز روی رنگ/روشنایی"),
+    sigma_space: int = Query(60, description="قدرت فیلتر هموارساز روی فاصله‌ی مکانی"),
     turdsize: int = Query(20, description="حذف خط/لکه‌های کوچک‌تر از این مقدار (پیکسل) برای تمیزتر شدن طرح"),
     max_dimension: int = Query(
-        400, description="حداکثر عرض/ارتفاع برای لبه‌یابی؛ کوچک‌تر یعنی خطوط ساده‌تر و کمتر شلوغ"
+        600, description="حداکثر عرض/ارتفاع برای لبه‌یابی؛ کوچک‌تر یعنی خطوط ساده‌تر ولی جزئیات کمتر"
     ),
     invert: bool = Query(False, description="اگر خطوط باید سفید روی سیاه باشند"),
 ):
@@ -126,16 +128,16 @@ async def vectorize(
     if img is None:
         return JSONResponse(status_code=400, content={"error": "تصویر قابل خواندن نیست"})
 
-    # ۲. کوچک‌کردن ابعاد قبل از لبه‌یابی — مهم‌ترین عامل برای حذف شلوغی بافت‌های ریز (مثل ریش/مو)
+    # ۲. کوچک‌کردن ابعاد قبل از لبه‌یابی (نه خیلی زیاد، تا چشم/بینی/دهان از دست نروند)
     h0, w0 = img.shape[:2]
     scale = min(1.0, max_dimension / max(w0, h0))
     work_w, work_h = max(1, int(w0 * scale)), max(1, int(h0 * scale))
     img_small = cv2.resize(img, (work_w, work_h), interpolation=cv2.INTER_AREA)
 
-    # ۳. حذف بافت‌های ریز باقی‌مانده با فیلتر دوطرفه، بدون از بین بردن لبه‌های اصلی
+    # ۳. حذف بافت‌های ریز (ریش/مو) با فیلتر دوطرفه‌ی قوی‌تر، با حفظ لبه‌های اصلی صورت
     smoothed = img_small.copy()
     for _ in range(max(0, smoothing)):
-        smoothed = cv2.bilateralFilter(smoothed, d=9, sigmaColor=75, sigmaSpace=75)
+        smoothed = cv2.bilateralFilter(smoothed, d=9, sigmaColor=sigma_color, sigmaSpace=sigma_space)
 
     blurred = cv2.GaussianBlur(smoothed, (3, 3), 0)
 
@@ -266,8 +268,8 @@ async def shade(
 @app.post("/stencil")
 async def stencil(
     file: UploadFile = File(...),
-    low_threshold: int = Query(50, description="آستانه‌ی پایین Canny برای خط اصلی"),
-    high_threshold: int = Query(150, description="آستانه‌ی بالای Canny برای خط اصلی"),
+    low_threshold: int = Query(35, description="آستانه‌ی پایین Canny برای خط اصلی"),
+    high_threshold: int = Query(110, description="آستانه‌ی بالای Canny برای خط اصلی"),
     row_spacing: int = Query(5, description="فاصله‌ی بین ردیف‌های هاشور (پیکسل)"),
     dash_length: int = Query(3, description="طول هر تکه‌خط هاشور (پیکسل)"),
     max_dimension: int = Query(700, description="حداکثر عرض/ارتفاع کاری برای سرعت بیشتر"),
@@ -275,10 +277,12 @@ async def stencil(
     depth_weight: float = Query(
         0.35, description="سهم نقشه‌ی عمق در تراکم هاشور (۰ تا ۱)؛ باقی از روشنایی خود عکس گرفته می‌شود"
     ),
-    smoothing: int = Query(3, description="تعداد دفعات فیلتر هموارساز روی خط اصلی (حذف بافت ریز)"),
+    smoothing: int = Query(5, description="تعداد دفعات فیلتر هموارساز روی خط اصلی (حذف بافت ریز)"),
+    sigma_color: int = Query(80, description="قدرت فیلتر هموارساز روی رنگ/روشنایی"),
+    sigma_space: int = Query(60, description="قدرت فیلتر هموارساز روی فاصله‌ی مکانی"),
     turdsize: int = Query(20, description="حذف خط/لکه‌های کوچک‌تر از این مقدار (پیکسل) در خط اصلی"),
     lineart_dimension: int = Query(
-        400, description="ابعاد کاری مخصوص خط اصلی؛ کوچک‌تر یعنی خط ساده‌تر و کمتر شلوغ"
+        600, description="ابعاد کاری مخصوص خط اصلی؛ کوچک‌تر یعنی خط ساده‌تر ولی جزئیات کمتر"
     ),
 ):
     """خروجی نهایی و کامل: خط اصلی طرح (لاین‌آرت) + هاشور سایه‌روشن، در یک SVG واحد."""
@@ -312,7 +316,7 @@ async def stencil(
 
     smoothed = gray_lineart.copy()
     for _ in range(max(0, smoothing)):
-        smoothed = cv2.bilateralFilter(smoothed, d=9, sigmaColor=75, sigmaSpace=75)
+        smoothed = cv2.bilateralFilter(smoothed, d=9, sigmaColor=sigma_color, sigmaSpace=sigma_space)
     blurred = cv2.GaussianBlur(smoothed, (3, 3), 0)
     edges = cv2.Canny(blurred, low_threshold, high_threshold)
     bitmap = cv2.bitwise_not(edges)
