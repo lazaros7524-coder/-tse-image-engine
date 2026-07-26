@@ -32,6 +32,34 @@ def get_depth_session():
         )
     return _depth_session
 
+def compute_depth_map(img_bgr):
+    """نقشه‌ی عمق نرمال‌شده (بین ۰ تا ۱) را در ابعاد اصلی تصویر برمی‌گرداند."""
+    orig_h, orig_w = img_bgr.shape[:2]
+
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(
+        img_rgb, (DEPTH_INPUT_SIZE, DEPTH_INPUT_SIZE), interpolation=cv2.INTER_CUBIC
+    )
+    normalized = resized.astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    normalized = (normalized - mean) / std
+    input_tensor = normalized.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+
+    session = get_depth_session()
+    input_name = session.get_inputs()[0].name
+    outputs = session.run(None, {input_name: input_tensor})
+
+    depth_map = np.squeeze(outputs[0])
+    d_min, d_max = float(depth_map.min()), float(depth_map.max())
+    if d_max - d_min > 1e-6:
+        depth_norm = (depth_map - d_min) / (d_max - d_min)
+    else:
+        depth_norm = np.zeros_like(depth_map)
+
+    return cv2.resize(depth_norm, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+
+
 app = FastAPI(title="TSE Image Engine")
 
 app.add_middleware(
@@ -95,52 +123,84 @@ async def vectorize(
 
 @app.post("/depth")
 async def depth(file: UploadFile = File(...)):
-    # ۱. خواندن تصویر آپلودشده
     raw_bytes = await file.read()
     np_arr = np.frombuffer(raw_bytes, np.uint8)
     img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
     if img_bgr is None:
         return JSONResponse(status_code=400, content={"error": "تصویر قابل خواندن نیست"})
 
-    orig_h, orig_w = img_bgr.shape[:2]
-
-    # ۲. آماده‌سازی ورودی مدل (تغییر اندازه + نرمال‌سازی استاندارد ImageNet)
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    resized = cv2.resize(
-        img_rgb, (DEPTH_INPUT_SIZE, DEPTH_INPUT_SIZE), interpolation=cv2.INTER_CUBIC
-    )
-    normalized = resized.astype(np.float32) / 255.0
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    normalized = (normalized - mean) / std
-    input_tensor = normalized.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
-
-    # ۳. اجرای مدل
     try:
-        session = get_depth_session()
-        input_name = session.get_inputs()[0].name
-        outputs = session.run(None, {input_name: input_tensor})
+        depth_norm = compute_depth_map(img_bgr)
     except Exception as e:
         return JSONResponse(
             status_code=500,
             content={"error": "خطا در اجرای مدل عمق", "details": str(e)},
         )
 
-    depth_map = np.squeeze(outputs[0])
-
-    # ۴. نرمال‌سازی خروجی به یک تصویر grayscale قابل مشاهده
-    d_min, d_max = float(depth_map.min()), float(depth_map.max())
-    if d_max - d_min > 1e-6:
-        depth_norm = (depth_map - d_min) / (d_max - d_min)
-    else:
-        depth_norm = np.zeros_like(depth_map)
     depth_img = (depth_norm * 255).astype(np.uint8)
-
-    # ۵. بازگرداندن به ابعاد اصلی تصویر ورودی
-    depth_img = cv2.resize(depth_img, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
-
     success, png_bytes = cv2.imencode(".png", depth_img)
     if not success:
         return JSONResponse(status_code=500, content={"error": "خطا در تولید خروجی"})
 
     return Response(content=png_bytes.tobytes(), media_type="image/png")
+
+
+@app.post("/shade")
+async def shade(
+    file: UploadFile = File(...),
+    row_spacing: int = Query(4, description="فاصله‌ی بین ردیف‌های هاشور (پیکسل)"),
+    dash_length: int = Query(3, description="طول هر تکه‌خط هاشور (پیکسل)"),
+    max_dimension: int = Query(800, description="حداکثر عرض/ارتفاع کاری برای سرعت بیشتر"),
+    invert: bool = Query(False, description="اگر نواحی روشن باید پررنگ شوند به‌جای نواحی تیره"),
+):
+    raw_bytes = await file.read()
+    np_arr = np.frombuffer(raw_bytes, np.uint8)
+    img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return JSONResponse(status_code=400, content={"error": "تصویر قابل خواندن نیست"})
+
+    try:
+        depth_norm = compute_depth_map(img_bgr)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "خطا در اجرای مدل عمق", "details": str(e)},
+        )
+
+    orig_h, orig_w = depth_norm.shape[:2]
+
+    # ۱. کوچک‌کردن به یک ابعاد کاری برای سرعت و تعداد معقول خط‌ها
+    scale = min(1.0, max_dimension / max(orig_w, orig_h))
+    work_w, work_h = max(1, int(orig_w * scale)), max(1, int(orig_h * scale))
+    depth_work = cv2.resize(depth_norm, (work_w, work_h), interpolation=cv2.INTER_AREA)
+
+    # ۲. تبدیل عمق به «میزان جوهر»: نواحی دورتر/تیره‌تر = هاشور بیشتر
+    ink_map = depth_work if invert else (1.0 - depth_work)
+
+    # ۳. تولید هاشور با پخش خطای یک‌بعدی (مشابه دیترینگ برای پلاترهای قلمی)
+    svg_lines = []
+    for y in range(0, work_h, row_spacing):
+        error = 0.0
+        x = 0
+        while x < work_w:
+            error += float(ink_map[y, x])
+            if error >= 1.0:
+                error -= 1.0
+                x_end = min(x + dash_length, work_w)
+                svg_lines.append(
+                    f'<line x1="{x}" y1="{y}" x2="{x_end}" y2="{y}" '
+                    f'stroke="black" stroke-width="1"/>'
+                )
+                x = x_end
+            else:
+                x += 1
+
+    svg_content = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {work_w} {work_h}" '
+        f'width="{work_w}" height="{work_h}">'
+        f'<rect width="{work_w}" height="{work_h}" fill="white"/>'
+        + "".join(svg_lines)
+        + "</svg>"
+    )
+
+    return Response(content=svg_content, media_type="image/svg+xml")
