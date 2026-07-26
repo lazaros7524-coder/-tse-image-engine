@@ -1,190 +1,228 @@
-<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<title>تست موتور تبدیل تصویر TSE</title>
-<style>
-  body { font-family: Tahoma, Arial, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }
-  h1 { font-size: 22px; }
-  .box { border: 2px dashed #999; padding: 30px; text-align: center; border-radius: 10px; margin: 20px 0; }
-  button { background: #4f46e5; color: white; border: none; padding: 12px 24px; font-size: 16px; border-radius: 8px; cursor: pointer; }
-  button:disabled { background: #aaa; }
-  #status { margin-top: 15px; font-size: 15px; }
-  #result { margin-top: 20px; text-align: center; }
-  #result svg, #result img { max-width: 100%; border: 1px solid #ddd; background: white; }
-  .row { display: flex; gap: 20px; flex-wrap: wrap; justify-content: center; margin-top: 10px; }
-  .col { flex: 1; min-width: 250px; text-align: center; }
-  input[type=range] { width: 200px; }
-</style>
-</head>
-<body>
-  <h1>🎨 تست موتور تبدیل تصویر به وکتور (TSE)</h1>
-  <p>یک عکس انتخاب کنید و دکمه‌ی تبدیل را بزنید تا نتیجه را ببینید.</p>
+import subprocess
+import tempfile
+import os
+import urllib.request
 
-  <div class="box">
-    <input type="file" id="fileInput" accept="image/*"><br><br>
-    <label>حساسیت لبه (پایین): <span id="lowVal">50</span></label><br>
-    <input type="range" id="lowRange" min="10" max="200" value="50"><br>
-    <label>حساسیت لبه (بالا): <span id="highVal">150</span></label><br>
-    <input type="range" id="highRange" min="50" max="300" value="150"><br><br>
-    <button id="submitBtn">تبدیل به استنسیل</button>
-    <button id="depthBtn">تخمین نقشه‌ی عمق</button>
-    <button id="shadeBtn">تولید هاشور سایه‌روشن</button>
-  </div>
+import cv2
+import numpy as np
+import onnxruntime as ort
+from fastapi import FastAPI, UploadFile, File, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, JSONResponse
 
-  <div id="status"></div>
-  <div class="row">
-    <div class="col">
-      <h3>تصویر اصلی</h3>
-      <div id="originalPreview"></div>
-    </div>
-    <div class="col">
-      <h3>نتیجه (SVG)</h3>
-      <div id="result"></div>
-    </div>
-  </div>
+# مدل سبک و از پیش کوانتیزه‌ی Depth Anything V2 (Small) — حدود ۵۰ مگابایت
+DEPTH_MODEL_URL = (
+    "https://huggingface.co/onnx-community/depth-anything-v2-small/"
+    "resolve/main/onnx/model_quantized.onnx"
+)
+DEPTH_MODEL_PATH = "/tmp/depth_model.onnx"
+DEPTH_INPUT_SIZE = 518  # اندازه‌ی ورودی استاندارد این مدل
 
-<script>
-const SERVICE_URL = "https://tse-image-engine.onrender.com/vectorize";
+_depth_session = None
 
-const fileInput = document.getElementById('fileInput');
-const submitBtn = document.getElementById('submitBtn');
-const depthBtn = document.getElementById('depthBtn');
-const shadeBtn = document.getElementById('shadeBtn');
-const statusEl = document.getElementById('status');
-const resultEl = document.getElementById('result');
-const originalPreview = document.getElementById('originalPreview');
-const lowRange = document.getElementById('lowRange');
-const highRange = document.getElementById('highRange');
-const lowVal = document.getElementById('lowVal');
-const highVal = document.getElementById('highVal');
 
-lowRange.addEventListener('input', () => lowVal.textContent = lowRange.value);
-highRange.addEventListener('input', () => highVal.textContent = highRange.value);
+def get_depth_session():
+    """مدل را فقط یک‌بار (در اولین درخواست) دانلود و بارگذاری می‌کند."""
+    global _depth_session
+    if _depth_session is None:
+        if not os.path.exists(DEPTH_MODEL_PATH):
+            urllib.request.urlretrieve(DEPTH_MODEL_URL, DEPTH_MODEL_PATH)
+        _depth_session = ort.InferenceSession(
+            DEPTH_MODEL_PATH, providers=["CPUExecutionProvider"]
+        )
+    return _depth_session
 
-fileInput.addEventListener('change', () => {
-  const file = fileInput.files[0];
-  if (!file) return;
-  const url = URL.createObjectURL(file);
-  originalPreview.innerHTML = `<img src="${url}" style="max-width:100%;">`;
-});
+def compute_depth_map(img_bgr):
+    """نقشه‌ی عمق نرمال‌شده (بین ۰ تا ۱) را در ابعاد اصلی تصویر برمی‌گرداند."""
+    orig_h, orig_w = img_bgr.shape[:2]
 
-submitBtn.addEventListener('click', async () => {
-  const file = fileInput.files[0];
-  if (!file) {
-    statusEl.textContent = 'لطفاً اول یک عکس انتخاب کنید.';
-    return;
-  }
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(
+        img_rgb, (DEPTH_INPUT_SIZE, DEPTH_INPUT_SIZE), interpolation=cv2.INTER_CUBIC
+    )
+    normalized = resized.astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    normalized = (normalized - mean) / std
+    input_tensor = normalized.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
 
-  submitBtn.disabled = true;
-  statusEl.textContent = 'در حال ارسال و پردازش... (ممکن است سرور رایگان ۵۰ ثانیه‌ی اول کمی کند باشد)';
-  resultEl.innerHTML = '';
+    session = get_depth_session()
+    input_name = session.get_inputs()[0].name
+    outputs = session.run(None, {input_name: input_tensor})
 
-  const formData = new FormData();
-  formData.append('file', file);
+    depth_map = np.squeeze(outputs[0])
+    d_min, d_max = float(depth_map.min()), float(depth_map.max())
+    if d_max - d_min > 1e-6:
+        depth_norm = (depth_map - d_min) / (d_max - d_min)
+    else:
+        depth_norm = np.zeros_like(depth_map)
 
-  const params = new URLSearchParams({
-    low_threshold: lowRange.value,
-    high_threshold: highRange.value
-  });
+    return cv2.resize(depth_norm, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
 
-  try {
-    const response = await fetch(`${SERVICE_URL}?${params.toString()}`, {
-      method: 'POST',
-      body: formData
-    });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      statusEl.textContent = `خطا: ${response.status} - ${errText}`;
-      submitBtn.disabled = false;
-      return;
-    }
+app = FastAPI(title="TSE Image Engine")
 
-    const svgText = await response.text();
-    resultEl.innerHTML = svgText;
-    statusEl.textContent = '✅ با موفقیت انجام شد.';
-  } catch (err) {
-    statusEl.textContent = 'خطا در اتصال به سرویس: ' + err.message;
-  }
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-  submitBtn.disabled = false;
-});
 
-depthBtn.addEventListener('click', async () => {
-  const file = fileInput.files[0];
-  if (!file) {
-    statusEl.textContent = 'لطفاً اول یک عکس انتخاب کنید.';
-    return;
-  }
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
-  depthBtn.disabled = true;
-  statusEl.textContent = 'در حال تخمین عمق... (اولین اجرا ممکن است به دلیل دانلود مدل ۱-۲ دقیقه طول بکشد)';
-  resultEl.innerHTML = '';
 
-  const formData = new FormData();
-  formData.append('file', file);
+@app.post("/vectorize")
+async def vectorize(
+    file: UploadFile = File(...),
+    low_threshold: int = Query(50, description="آستانه‌ی پایین Canny"),
+    high_threshold: int = Query(150, description="آستانه‌ی بالای Canny"),
+    invert: bool = Query(False, description="اگر خطوط باید سفید روی سیاه باشند"),
+):
+    # ۱. خواندن تصویر آپلودشده
+    raw_bytes = await file.read()
+    np_arr = np.frombuffer(raw_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return JSONResponse(status_code=400, content={"error": "تصویر قابل خواندن نیست"})
 
-  try {
-    const response = await fetch("https://tse-image-engine.onrender.com/depth", {
-      method: 'POST',
-      body: formData
-    });
+    # ۲. کاهش نویز قبل از تشخیص لبه
+    blurred = cv2.GaussianBlur(img, (3, 3), 0)
 
-    if (!response.ok) {
-      const errText = await response.text();
-      statusEl.textContent = `خطا: ${response.status} - ${errText}`;
-      depthBtn.disabled = false;
-      return;
-    }
+    # ۳. تشخیص لبه با Canny
+    edges = cv2.Canny(blurred, low_threshold, high_threshold)
 
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    resultEl.innerHTML = `<img src="${url}" style="max-width:100%;">`;
-    statusEl.textContent = '✅ نقشه‌ی عمق با موفقیت تولید شد.';
-  } catch (err) {
-    statusEl.textContent = 'خطا در اتصال به سرویس: ' + err.message;
-  }
+    # ۴. آماده‌سازی بیت‌مپ برای Potrace (خطوط سیاه روی زمینه‌ی سفید)
+    bitmap = cv2.bitwise_not(edges) if not invert else edges
 
-  depthBtn.disabled = false;
-});
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        bmp_path = os.path.join(tmp_dir, "edges.bmp")
+        svg_path = os.path.join(tmp_dir, "edges.svg")
+        cv2.imwrite(bmp_path, bitmap)
 
-shadeBtn.addEventListener('click', async () => {
-  const file = fileInput.files[0];
-  if (!file) {
-    statusEl.textContent = 'لطفاً اول یک عکس انتخاب کنید.';
-    return;
-  }
+        # ۵. فراخوانی Potrace برای تبدیل بیت‌مپ به SVG وکتوری
+        result = subprocess.run(
+            ["potrace", bmp_path, "-s", "-o", svg_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "خطا در اجرای potrace", "details": result.stderr},
+            )
 
-  shadeBtn.disabled = true;
-  statusEl.textContent = 'در حال تولید هاشور سایه‌روشن...';
-  resultEl.innerHTML = '';
+        with open(svg_path, "r", encoding="utf-8") as f:
+            svg_content = f.read()
 
-  const formData = new FormData();
-  formData.append('file', file);
+    return Response(content=svg_content, media_type="image/svg+xml")
 
-  try {
-    const response = await fetch("https://tse-image-engine.onrender.com/shade", {
-      method: 'POST',
-      body: formData
-    });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      statusEl.textContent = `خطا: ${response.status} - ${errText}`;
-      shadeBtn.disabled = false;
-      return;
-    }
+@app.post("/depth")
+async def depth(file: UploadFile = File(...)):
+    raw_bytes = await file.read()
+    np_arr = np.frombuffer(raw_bytes, np.uint8)
+    img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return JSONResponse(status_code=400, content={"error": "تصویر قابل خواندن نیست"})
 
-    const svgText = await response.text();
-    resultEl.innerHTML = svgText;
-    statusEl.textContent = '✅ هاشور با موفقیت تولید شد.';
-  } catch (err) {
-    statusEl.textContent = 'خطا در اتصال به سرویس: ' + err.message;
-  }
+    try:
+        depth_norm = compute_depth_map(img_bgr)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "خطا در اجرای مدل عمق", "details": str(e)},
+        )
 
-  shadeBtn.disabled = false;
-});
-</script>
-</body>
-</html>
+    depth_img = (depth_norm * 255).astype(np.uint8)
+    success, png_bytes = cv2.imencode(".png", depth_img)
+    if not success:
+        return JSONResponse(status_code=500, content={"error": "خطا در تولید خروجی"})
+
+    return Response(content=png_bytes.tobytes(), media_type="image/png")
+
+
+@app.post("/shade")
+async def shade(
+    file: UploadFile = File(...),
+    row_spacing: int = Query(5, description="فاصله‌ی بین ردیف‌های هاشور (پیکسل)"),
+    dash_length: int = Query(3, description="طول هر تکه‌خط هاشور (پیکسل)"),
+    max_dimension: int = Query(700, description="حداکثر عرض/ارتفاع کاری برای سرعت بیشتر"),
+    curve_strength: float = Query(15.0, description="میزان انحنای خطوط متناسب با فرم عمق"),
+    depth_weight: float = Query(
+        0.35,
+        description="سهم نقشه‌ی عمق در تراکم هاشور (۰ تا ۱)؛ باقی از روشنایی خود عکس (جزئیات ریز) گرفته می‌شود",
+    ),
+    invert: bool = Query(False, description="اگر نواحی روشن باید پررنگ شوند به‌جای نواحی تیره"),
+):
+    raw_bytes = await file.read()
+    np_arr = np.frombuffer(raw_bytes, np.uint8)
+    img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return JSONResponse(status_code=400, content={"error": "تصویر قابل خواندن نیست"})
+
+    try:
+        depth_norm = compute_depth_map(img_bgr)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "خطا در اجرای مدل عمق", "details": str(e)},
+        )
+
+    orig_h, orig_w = depth_norm.shape[:2]
+
+    # ۱. کوچک‌کردن به یک ابعاد کاری برای سرعت و تعداد معقول خط‌ها
+    scale = min(1.0, max_dimension / max(orig_w, orig_h))
+    work_w, work_h = max(1, int(orig_w * scale)), max(1, int(orig_h * scale))
+    depth_work = cv2.resize(depth_norm, (work_w, work_h), interpolation=cv2.INTER_AREA)
+
+    # ۲. روشنایی خودِ عکس اصلی برای جزئیات ریز (چروک، سایه‌ی زیر چشم و ...)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray_work = cv2.resize(gray, (work_w, work_h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    gray_work = cv2.GaussianBlur(gray_work, (0, 0), sigmaX=1.5)
+
+    # ۳. نسخه‌ی هموارشده از عمق فقط برای تعیین انحنای کلی خطوط (فرم بزرگ)
+    depth_smooth = cv2.GaussianBlur(depth_work, (0, 0), sigmaX=max(1, row_spacing))
+
+    # ۴. ترکیب «میزان جوهر» از عمق (فرم کلی) و روشنایی عکس (جزئیات ریز)
+    dw = float(np.clip(depth_weight, 0.0, 1.0))
+    ink_depth = depth_work if invert else (1.0 - depth_work)
+    ink_luma = gray_work if invert else (1.0 - gray_work)
+    ink_map = dw * ink_depth + (1.0 - dw) * ink_luma
+
+    # ۵. تولید هاشور کانتورمحور (منحنی بر اساس فرم عمق، تراکم بر اساس ترکیب عمق+روشنایی)
+    svg_lines = []
+    for y0 in range(0, work_h, row_spacing):
+        y_curve = y0 + curve_strength * (depth_smooth[min(y0, work_h - 1), :] - 0.5)
+        y_curve = np.clip(y_curve, 0, work_h - 1)
+
+        error = 0.0
+        x = 0
+        while x < work_w:
+            yi = min(int(round(y_curve[x])), work_h - 1)
+            error += float(ink_map[yi, x])
+            if error >= 1.0:
+                error -= 1.0
+                x_end = min(x + dash_length, work_w)
+                y1 = y_curve[x]
+                y2 = y_curve[min(x_end - 1, work_w - 1)]
+                svg_lines.append(
+                    f'<line x1="{x}" y1="{y1:.1f}" x2="{x_end}" y2="{y2:.1f}" '
+                    f'stroke="black" stroke-width="1"/>'
+                )
+                x = x_end
+            else:
+                x += 1
+
+    svg_content = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {work_w} {work_h}" '
+        f'width="{work_w}" height="{work_h}">'
+        f'<rect width="{work_w}" height="{work_h}" fill="white"/>'
+        + "".join(svg_lines)
+        + "</svg>"
+    )
+
+    return Response(content=svg_content, media_type="image/svg+xml")
