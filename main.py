@@ -2,6 +2,7 @@ import subprocess
 import tempfile
 import os
 import re
+import gc
 import urllib.request
 
 import cv2
@@ -37,7 +38,8 @@ def get_depth_session():
 
 
 def compute_depth_map(img_bgr):
-    """نقشه‌ی عمق نرمال‌شده (بین ۰ تا ۱) را در ابعاد اصلی تصویر برمی‌گرداند."""
+    """نقشه‌ی عمق را محاسبه و بلافاصله حافظه‌ی مدل را آزاد می‌کند."""
+    global _depth_session
     orig_h, orig_w = img_bgr.shape[:2]
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -53,6 +55,10 @@ def compute_depth_map(img_bgr):
     session = get_depth_session()
     input_name = session.get_inputs()[0].name
     outputs = session.run(None, {input_name: input_tensor})
+
+    # آزادسازی فوری حافظه‌ی مدل عمق بعد از استفاده
+    _depth_session = None
+    gc.collect()
 
     depth_map = np.squeeze(outputs[0])
     d_min, d_max = float(depth_map.min()), float(depth_map.max())
@@ -78,10 +84,16 @@ def get_rembg_session():
 
 
 def get_foreground_mask(img_bgr):
-    """ماسک سوژه‌ی اصلی (۰ تا ۱)، مستقل از نوع موضوع (انسان/حیوان/شیء)."""
+    """ماسک سوژه‌ی اصلی را محاسبه و بلافاصله حافظه‌ی مدل rembg را آزاد می‌کند."""
+    global _rembg_session
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     session = get_rembg_session()
     result_mask = remove(img_rgb, session=session, only_mask=True)
+
+    # آزادسازی فوری حافظه‌ی مدل rembg بعد از استفاده
+    _rembg_session = None
+    gc.collect()
+
     mask = np.array(result_mask).astype(np.float32) / 255.0
     return mask
 
